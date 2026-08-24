@@ -32,19 +32,38 @@ BEGIN_MARK='# >>> lfreleng-actions/shell-scripts >>>'
 END_MARK='# <<< lfreleng-actions/shell-scripts <<<'
 BACKUP_SUFFIX='.lfreleng.bak'
 
+# A literal newline. Command substitution strips them, so this is the
+# portable way to hold one for the checks below.
+newline='
+'
+
 PROG=$(basename -- "$0")
 
 # Absolute path to this clone, independent of the caller's directory.
 REPO_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 TARGETS=''
+STRAYS=''
+BLOCK=''
 cleanup() {
     [ -n "$TARGETS" ] && rm -f "$TARGETS"
+    [ -n "$STRAYS" ] && rm -f "$STRAYS"
+    [ -n "$BLOCK" ] && rm -f "$BLOCK"
     return 0
 }
-trap cleanup EXIT HUP INT TERM
+
+# A signal handler that merely tidied up would let the script carry on
+# where it left off: Ctrl-C at the prompt would return through the
+# 'read' below and install with the default answer, which is the
+# opposite of what the person pressing it asked for. Clean up and leave,
+# reporting the signal in the exit status as a shell does.
+trap cleanup EXIT
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 fork_path=''
+fork_path_set=0
 assume_yes=0
 dry_run=0
 action=install
@@ -92,10 +111,12 @@ while [ $# -gt 0 ]; do
         -p|--fork-path)
             [ $# -ge 2 ] || die "$1 needs a directory"
             fork_path=$2
+            fork_path_set=1
             shift 2
             ;;
         --fork-path=*)
             fork_path=${1#*=}
+            fork_path_set=1
             shift
             ;;
         -y|--yes)       assume_yes=1;     shift ;;
@@ -124,26 +145,120 @@ expand_tilde() {
     esac
 }
 
+# Escape the characters that a double-quoted shell assignment would
+# otherwise act on, so that a directory holding a literal '$', backtick,
+# quote or backslash survives into the start-up file as itself rather
+# than as something for the shell to expand -- or run.
+escape_literal() {
+    printf '%s' "$1" | sed -e 's/[\\"$`]/\\&/g'
+}
+
 # Re-introduce $HOME as a variable reference, so the block stays valid in
 # a start-up file shared between machines with different home directories.
-# The result is meant for use inside double quotes.
+# That reference is the one dollar sign left unescaped. The result is
+# meant for use inside double quotes.
 portable_path() {
     # shellcheck disable=SC2016  # emitting the text '$HOME', not its value
     case "$1" in
         "$HOME")   printf '%s\n' '$HOME' ;;
-        "$HOME"/*) printf '%s\n' "\$HOME/${1#"$HOME"/}" ;;
-        *)         printf '%s\n' "$1" ;;
+        "$HOME"/*) printf '$HOME/%s\n' "$(escape_literal "${1#"$HOME"/}")" ;;
+        *)         printf '%s\n' "$(escape_literal "$1")" ;;
     esac
 }
 
+# The same, for a value that may be a PATH-style list of directories.
+# Encoding the whole string as one pathname would rewrite a leading
+# $HOME and leave every later entry spelled out in full, which is worse
+# than either extreme: the file then works on one machine and quietly
+# searches somebody else's home on the next.
+portable_path_list() {
+    _ppl_rest=$1
+    _ppl_out=''
+
+    while [ -n "$_ppl_rest" ]; do
+        case "$_ppl_rest" in
+            *:*) _ppl_one=${_ppl_rest%%:*}; _ppl_rest=${_ppl_rest#*:} ;;
+            *)   _ppl_one=$_ppl_rest;       _ppl_rest='' ;;
+        esac
+        [ -n "$_ppl_one" ] || continue
+
+        _ppl_one=$(portable_path "$_ppl_one")
+        if [ -z "$_ppl_out" ]; then
+            _ppl_out=$_ppl_one
+        else
+            _ppl_out="$_ppl_out:$_ppl_one"
+        fi
+    done
+
+    printf '%s\n' "$_ppl_out"
+}
+
+# Undo what portable_path_list did, so --status reports the directory
+# rather than the shell source that names it. The format is this
+# installer's own, so decoding it is a matter of reversing two known
+# steps -- no eval, which would hand the contents of somebody's start-up
+# file to the shell.
+decode_recorded() {
+    _dr_rest=$1
+    _dr_out=''
+
+    while [ -n "$_dr_rest" ]; do
+        case "$_dr_rest" in
+            *:*) _dr_one=${_dr_rest%%:*}; _dr_rest=${_dr_rest#*:} ;;
+            *)   _dr_one=$_dr_rest;       _dr_rest='' ;;
+        esac
+        [ -n "$_dr_one" ] || continue
+
+        # The deliberate $HOME reference, which sits unescaped at the
+        # start of an entry. A literal dollar there would read '\$'.
+        # shellcheck disable=SC2016  # matching the text '$HOME', not its value
+        case "$_dr_one" in
+            '$HOME')   _dr_one=$HOME ;;
+            '$HOME/'*) _dr_one="$HOME/${_dr_one#'$HOME/'}" ;;
+        esac
+
+        # Then escape_literal's backslashes, which only ever precede one
+        # of \ " $ or a backtick.
+        _dr_one=$(printf '%s' "$_dr_one" | sed -e 's/\\\(.\)/\1/g')
+
+        if [ -z "$_dr_out" ]; then
+            _dr_out=$_dr_one
+        else
+            _dr_out="$_dr_out:$_dr_one"
+        fi
+    done
+
+    printf '%s\n' "$_dr_out"
+}
+
+# Run a command for each entry of a PATH-style list, in order.
+for_each_root() {
+    _fer_cmd=$1
+    _fer_rest=$2
+
+    while [ -n "$_fer_rest" ]; do
+        case "$_fer_rest" in
+            *:*) _fer_one=${_fer_rest%%:*}; _fer_rest=${_fer_rest#*:} ;;
+            *)   _fer_one=$_fer_rest;       _fer_rest='' ;;
+        esac
+        [ -n "$_fer_one" ] || continue
+        "$_fer_cmd" "$_fer_one"
+    done
+}
+
 # Which start-up files to manage, one per line. A shell that is not
-# installed is not worth writing a file for; one that is gets its
-# interactive rc file, created when absent.
+# installed is not worth writing a file for; one that is gets the files
+# it reads, created when none exists.
 #
-# bash reads ~/.bashrc for interactive non-login shells and ~/.bash_profile
-# for login shells. On macOS, Terminal starts login shells, so a
-# ~/.bash_profile that does not pull in ~/.bashrc would never see the
-# block. Manage that file too when it exists and stands alone.
+# bash is the awkward one. It reads ~/.bashrc for interactive non-login
+# shells, and, for login shells -- which is what macOS Terminal starts --
+# the first of ~/.bash_profile, ~/.bash_login and ~/.profile that exists,
+# and no other. Whether any of them reaches ~/.bashrc cannot be settled
+# by reading them: a '. ~/.bashrc' can sit in a function nobody calls.
+# So manage every one that exists and accept the redundancy -- sourcing
+# loader.sh twice re-defines the same functions -- and create
+# ~/.bash_profile when none of the three does, since otherwise a login
+# shell would read nothing this installer had touched.
 profile_targets() {
     if command -v zsh >/dev/null 2>&1 || [ -f "${ZDOTDIR:-$HOME}/.zshrc" ]; then
         printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc"
@@ -152,25 +267,42 @@ profile_targets() {
     if command -v bash >/dev/null 2>&1 || [ -f "$HOME/.bashrc" ]; then
         printf '%s\n' "$HOME/.bashrc"
 
-        if [ -f "$HOME/.bash_profile" ] &&
-            ! grep -q '\.bashrc' "$HOME/.bash_profile" 2>/dev/null; then
+        _pt_login=0
+        for _pt_file in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+            if [ -f "$_pt_file" ]; then
+                printf '%s\n' "$_pt_file"
+                _pt_login=1
+            fi
+        done
+
+        if [ "$_pt_login" -eq 0 ]; then
             printf '%s\n' "$HOME/.bash_profile"
         fi
     fi
 }
 
 # Every file a block could ever have been written to, whether or not this
-# run would choose it. Removal has to be exhaustive: a ~/.bash_profile
-# that gained a line sourcing ~/.bashrc since install time drops out of
-# profile_targets, and its block would otherwise be orphaned there.
+# run would choose it. Removal has to be as exhaustive as it can be: an
+# earlier version of this installer chose its targets by different rules,
+# and a block it left behind still runs.
+#
+# $ZDOTDIR moves zsh's files out of $HOME entirely, and its value can
+# differ between the install and the uninstall. Cover both places. The
+# one case that cannot be covered is a $ZDOTDIR set then and unset now:
+# nothing here records where it pointed, so --uninstall says how to
+# reach that block when it finds none.
 candidate_files() {
     printf '%s\n' \
-        "${ZDOTDIR:-$HOME}/.zshrc" \
-        "${ZDOTDIR:-$HOME}/.zprofile" \
+        "$HOME/.zshrc" \
+        "$HOME/.zprofile" \
         "$HOME/.bashrc" \
         "$HOME/.bash_profile" \
         "$HOME/.bash_login" \
         "$HOME/.profile"
+
+    if [ -n "${ZDOTDIR:-}" ] && [ "$ZDOTDIR" != "$HOME" ]; then
+        printf '%s\n' "$ZDOTDIR/.zshrc" "$ZDOTDIR/.zprofile"
+    fi
 }
 
 has_block() {
@@ -178,23 +310,89 @@ has_block() {
     grep -qxF "$BEGIN_MARK" "$1" 2>/dev/null
 }
 
-# Refuse to touch a file whose markers do not pair up: a hand-edit that
-# deleted one of them would otherwise see this script swallow, or
-# duplicate, a chunk of somebody's start-up file.
+# Validate every file in the list at $1 before any of them is written.
+# Checking each one as it is reached would see a bad file abort the run
+# partway through, leaving some shells with the block and others without
+# -- a state nobody asked for and nothing here reports.
+#
+# $2 selects which files need to be writable: 'all' for an install, which
+# touches every target, or 'blocks' for an uninstall, which only rewrites
+# the files that carry one.
+preflight() {
+    _pf_mode=$2
+
+    while IFS= read -r _pf_file; do
+        check_markers "$_pf_file"
+
+        if [ "$_pf_mode" = all ] || has_block "$_pf_file"; then
+            check_writable "$_pf_file"
+        fi
+    done <"$1"
+}
+
+# Refuse a target that cannot be rewritten in place, or whose directory
+# will not hold the backup taken first. Marker checking alone would let
+# an unwritable file, or a name that turns out to be a directory, fail
+# halfway through the run.
+check_writable() {
+    _cw_file=$1
+
+    if [ -e "$_cw_file" ] || [ -L "$_cw_file" ]; then
+        if [ -d "$_cw_file" ]; then
+            die "$_cw_file is a directory, not a start-up file"
+        fi
+        if [ ! -f "$_cw_file" ]; then
+            die "$_cw_file is not a regular file (a dangling symlink, perhaps)"
+        fi
+        if [ ! -w "$_cw_file" ]; then
+            die "$_cw_file is not writable"
+        fi
+    fi
+
+    _cw_dir=$(dirname -- "$_cw_file")
+    if [ ! -d "$_cw_dir" ]; then
+        die "$_cw_dir does not exist"
+    fi
+    if [ ! -w "$_cw_dir" ]; then
+        # Needed to create the file, and to put the backup beside it.
+        die "$_cw_dir is not writable"
+    fi
+}
+
+# Refuse to touch a file whose markers do not form one properly ordered
+# pair. Counting them is not enough: a closing marker standing before an
+# opening one balances, and strip_block would then keep the text above it
+# and drop everything below -- which is somebody's start-up file gone.
 check_markers() {
     _cm_file=$1
     [ -f "$_cm_file" ] || return 0
 
-    _cm_open=$(grep -cxF "$BEGIN_MARK" "$_cm_file" 2>/dev/null || true)
-    _cm_close=$(grep -cxF "$END_MARK" "$_cm_file" 2>/dev/null || true)
+    _cm_state=$(awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+        BEGIN            { state = "ok" }
+        state != "ok"    { next }
+        $0 == begin      { if (open || seen) state = "repeated"
+                           else { open = 1; seen = 1 }
+                           next }
+        $0 == end        { if (!open) state = "unopened"
+                           else open = 0
+                           next }
+        END              { if (state == "ok" && open) state = "unclosed"
+                           print state }
+    ' "$_cm_file")
 
-    if [ "$_cm_open" != "$_cm_close" ] || [ "$_cm_open" -gt 1 ]; then
-        die "$_cm_file holds $_cm_open opening and $_cm_close closing markers; repair it by hand"
-    fi
+    case "$_cm_state" in
+        ok)       return 0 ;;
+        repeated) _cm_why='holds more than one managed block' ;;
+        unopened) _cm_why='holds a closing marker before its opening one' ;;
+        unclosed) _cm_why='holds an opening marker with no closing one' ;;
+        *)        _cm_why='holds markers this installer cannot make sense of' ;;
+    esac
+
+    die "$_cm_file $_cm_why; repair it by hand"
 }
 
 # Copy stdin to stdout with the managed block, and any blank lines that
-# trail the file, removed.
+# trail the file, removed. Used by --uninstall.
 strip_block() {
     awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
         $0 == begin { inside = 1; next }
@@ -207,24 +405,77 @@ strip_block() {
     '
 }
 
+# Write $1 with the managed block replaced in place by the contents of
+# $2, or appended when $1 carries no block. In place matters: anything a
+# person wrote after the block runs after it today, and moving the block
+# to the end would silently reorder their start-up file -- putting their
+# commands ahead of the variables and functions this block defines.
+replace_block() {
+    awk -v begin="$BEGIN_MARK" -v end="$END_MARK" -v blockfile="$2" '
+        function flush() { printf "%s", pending; pending = "" }
+        function emit(   line) {
+            while ((getline line < blockfile) > 0) print line
+            close(blockfile)
+        }
+        $0 == begin { flush(); emit(); replaced = 1; inside = 1; next }
+        $0 == end   { inside = 0; next }
+        inside      { next }
+        # Hold blank lines back, so the ones that merely trail the file
+        # can be dropped before an appended block and kept after a
+        # replaced one.
+        /^[[:space:]]*$/ { pending = pending $0 "\n"; next }
+        { flush(); print; body = 1 }
+        END {
+            if (replaced) { flush() }
+            else {
+                if (body) print ""
+                emit()
+            }
+        }
+    ' "$1"
+}
+
 emit_block() {
     cat <<EOF
 $BEGIN_MARK
 # Managed by shell-scripts/install.sh -- re-running the installer rewrites
 # this block, and 'install.sh --uninstall' removes it. Edit
 # LFRELENG_ACTIONS_FORK_PATH below if your clones move; setting it earlier
-# in this file, or in the environment, wins over the value here.
+# in this file, or in the environment, wins over the value here. It may
+# be a PATH-style colon-separated list. LFRELENG_SHELL_SCRIPTS is the
+# clone this block was written from; re-run install.sh if it moves.
 if [ -z "\${LFRELENG_ACTIONS_FORK_PATH:-}" ]; then
     LFRELENG_ACTIONS_FORK_PATH="$1"
 fi
 export LFRELENG_ACTIONS_FORK_PATH
 LFRELENG_SHELL_SCRIPTS="$2"
 export LFRELENG_SHELL_SCRIPTS
-if [ -r "\$LFRELENG_SHELL_SCRIPTS/loader.sh" ]; then
+# The tools are bash and zsh only, and a login ~/.profile is read by
+# other shells too, so check which shell is asking before loading them.
+if [ -n "\${BASH_VERSION:-}\${ZSH_VERSION:-}" ] &&
+    [ -r "\$LFRELENG_SHELL_SCRIPTS/loader.sh" ]; then
     . "\$LFRELENG_SHELL_SCRIPTS/loader.sh"
 fi
 $END_MARK
 EOF
+}
+
+# The value the block records for the clone directory, read back out of
+# the first managed block found. Reported by --status, where the variable
+# this process inherited says only what the shell that launched it knew,
+# which right after an install is the previous answer or none at all.
+recorded_fork_path() {
+    awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+        $0 == begin { inside = 1; next }
+        $0 == end   { inside = 0; next }
+        inside && $0 ~ /^[[:space:]]*LFRELENG_ACTIONS_FORK_PATH="/ {
+            line = $0
+            sub(/^[[:space:]]*LFRELENG_ACTIONS_FORK_PATH="/, "", line)
+            sub(/"[[:space:]]*$/, "", line)
+            print line
+            exit
+        }
+    ' "$1" 2>/dev/null
 }
 
 # Replace a file's contents without replacing the file: many people keep
@@ -248,7 +499,20 @@ install_content() {
     fi
 
     if [ -f "$_ic_file" ]; then
+        # Replace the backup entry rather than writing through it: a
+        # symlink sitting at that name, planted or left behind, would
+        # otherwise see 'cp' follow it and overwrite whatever it points
+        # at, while leaving no backup at all.
+        rm -f "$_ic_file$BACKUP_SUFFIX"
         cp -p "$_ic_file" "$_ic_file$BACKUP_SUFFIX"
+    else
+        # Bring a new file into being under a private umask before
+        # writing to it. A permissive umask in the caller's environment
+        # would otherwise leave shell configuration group- or
+        # world-writable, which is an invitation to have commands run at
+        # somebody else's next login. An existing file keeps whatever
+        # permissions it already had.
+        ( umask 077; : >"$_ic_file" )
     fi
 
     cat "$_ic_new" >"$_ic_file"
@@ -258,6 +522,30 @@ install_content() {
 # Collect the targets into a file, so the loops below can read them
 # without a pipeline: a pipeline puts the loop in a subshell, where the
 # counters it keeps would not survive.
+#
+# That file is newline-delimited, so a newline in either variable the
+# paths are built from would split one file name into two and send this
+# script rummaging through files nobody named. Both are checked before a
+# single path is emitted -- as is HOME being a usable directory at all,
+# since every target hangs off it and this script rewrites executable
+# configuration.
+case "${HOME:-}" in
+    '') die 'HOME is unset or empty; cannot tell which files to manage' ;;
+    /*) ;;
+    *)  die "HOME is not an absolute path ('$HOME')" ;;
+esac
+case "$HOME" in
+    *"$newline"*) die 'HOME contains a newline; cannot tell which files to manage' ;;
+esac
+case "${ZDOTDIR:-}" in
+    '') ;;
+    /*) ;;
+    *)  die "ZDOTDIR is not an absolute path ('$ZDOTDIR')" ;;
+esac
+case "${ZDOTDIR:-}" in
+    *"$newline"*) die 'ZDOTDIR contains a newline; cannot tell which files to manage' ;;
+esac
+
 TARGETS=$(mktemp "${TMPDIR:-/tmp}/lfreleng-targets.XXXXXX")
 profile_targets >"$TARGETS"
 
@@ -265,14 +553,15 @@ profile_targets >"$TARGETS"
 
 if [ "$action" = status ]; then
     say "clone:      $REPO_DIR"
-    say "fork path:  ${LFRELENG_ACTIONS_FORK_PATH:-(not set in this shell)}"
     say "start-up files:"
 
     seen=0
+    recorded=''
     while IFS= read -r file; do
         seen=1
         if has_block "$file"; then
             report installed "$file"
+            [ -n "$recorded" ] || recorded=$(recorded_fork_path "$file")
         elif [ -f "$file" ]; then
             report absent "$file"
         else
@@ -285,13 +574,26 @@ if [ "$action" = status ]; then
     fi
 
     # A block left in a file this run would not choose -- because the
-    # shell landscape changed since install time -- still runs, so name it
-    # rather than letting it sit there unaccounted for.
-    candidate_files | while IFS= read -r file; do
+    # shell landscape changed since install time -- still runs, so name
+    # it rather than letting it sit there unaccounted for, and let it
+    # answer for the recorded directory when no current target did.
+    STRAYS=$(mktemp "${TMPDIR:-/tmp}/lfreleng-strays.XXXXXX")
+    candidate_files >"$STRAYS"
+    while IFS= read -r file; do
         if has_block "$file" && ! grep -qxF "$file" "$TARGETS"; then
             report stray "$file"
+            [ -n "$recorded" ] || recorded=$(recorded_fork_path "$file")
         fi
-    done
+    done <"$STRAYS"
+    rm -f "$STRAYS"
+
+    say "fork path:"
+    if [ -n "$recorded" ]; then
+        report recorded "$(decode_recorded "$recorded")"
+    else
+        report recorded '(no managed block found)'
+    fi
+    report "this shell" "${LFRELENG_ACTIONS_FORK_PATH:-(not set here)}"
     exit 0
 fi
 
@@ -302,11 +604,11 @@ if [ "$action" = uninstall ]; then
 
     # Every candidate, not just this run's targets: see candidate_files.
     candidate_files >"$TARGETS"
+    preflight "$TARGETS" blocks
 
     removed=0
     while IFS= read -r file; do
         has_block "$file" || continue
-        check_markers "$file"
         removed=1
 
         if [ "$dry_run" -eq 1 ]; then
@@ -316,6 +618,9 @@ if [ "$action" = uninstall ]; then
 
         tmp=$(mktemp "${TMPDIR:-/tmp}/lfreleng-install.XXXXXX")
         strip_block <"$file" >"$tmp"
+        # See install_content: never write through a symlink left at the
+        # backup's name.
+        rm -f "$file$BACKUP_SUFFIX"
         cp -p "$file" "$file$BACKUP_SUFFIX"
         cat "$tmp" >"$file"
         rm -f "$tmp"
@@ -324,6 +629,12 @@ if [ "$action" = uninstall ]; then
 
     if [ "$removed" -eq 0 ]; then
         say "  (nothing to remove)"
+        if [ -z "${ZDOTDIR:-}" ]; then
+            say ""
+            say "If you installed with ZDOTDIR set, zsh's file lives elsewhere."
+            say "Re-run with the same value to reach it:"
+            say "  ZDOTDIR=/your/zsh/dir $PROG --uninstall"
+        fi
     elif [ "$dry_run" -eq 1 ]; then
         say ""
         say "Dry run: nothing was written."
@@ -339,14 +650,30 @@ fi
 
 [ -r "$REPO_DIR/loader.sh" ] || die "no loader.sh beside $PROG in $REPO_DIR"
 
+# The block is line-oriented, and this path goes into it as surely as the
+# clone directory does. A newline in it would split the assignment and,
+# worse, could plant a line that reads as one of the markers, after which
+# nothing here could parse the block again.
+case "$REPO_DIR" in
+    *"$newline"*) die "the path to this clone contains a newline: $REPO_DIR" ;;
+esac
+
 # The clone root. Its default is the directory this clone sits in, which
 # is almost always the answer: people keep their clones side by side.
+#
+# An inherited value is passed through as it stands. Expanding a tilde
+# here would reach only the first entry of a PATH-style list, leaving
+# '~/one:~/two' half-absolute and the second entry to be rejected as
+# relative; normalise_root expands each entry on its own below.
 default_root=$(dirname -- "$REPO_DIR")
 if [ -n "${LFRELENG_ACTIONS_FORK_PATH:-}" ]; then
-    default_root=$(expand_tilde "$LFRELENG_ACTIONS_FORK_PATH")
+    default_root=$LFRELENG_ACTIONS_FORK_PATH
 fi
 
-if [ -z "$fork_path" ]; then
+# Only fall back to the default when --fork-path was absent altogether.
+# Testing the value instead would see an explicit empty one -- which is
+# a mistake worth reporting -- quietly install the default.
+if [ "$fork_path_set" -eq 0 ]; then
     if [ "$assume_yes" -eq 1 ] || [ ! -t 0 ]; then
         fork_path=$default_root
     else
@@ -366,55 +693,79 @@ EOF
     fi
 fi
 
-fork_path=$(expand_tilde "$fork_path")
-fork_path=${fork_path%/}
-[ -n "$fork_path" ] || die 'the clone directory cannot be empty'
+# The answer may name several directories, PATH-style, because that is
+# what LFRELENG_ACTIONS_FORK_PATH accepts. Normalise and check each
+# entry on its own, then rebuild the list.
+normalise_root() {
+    _nr_one=$(expand_tilde "$1")
+    # Trim a trailing slash, but not the one that is the whole of the
+    # path: '/' is a valid, if eccentric, place to keep clones.
+    [ "$_nr_one" = / ] || _nr_one=${_nr_one%/}
+    [ -n "$_nr_one" ] || die 'the clone directory cannot be empty'
 
+    case "$_nr_one" in
+        /*) ;;
+        *)  die "'$_nr_one' is not an absolute path" ;;
+    esac
+
+    if [ ! -d "$_nr_one" ]; then
+        warn "$PROG: warning: '$_nr_one' does not exist yet;"
+        warn "$PROG: warning: 'release <repo>' finds no clones there"
+    fi
+
+    if [ -z "$normalised" ]; then
+        normalised=$_nr_one
+    else
+        normalised="$normalised:$_nr_one"
+    fi
+}
+
+# A newline anywhere in the answer would split the assignment across two
+# lines and leave the second half of it as a command for the shell to
+# run. Nothing escapes that, so refuse it outright.
 case "$fork_path" in
-    /*) ;;
-    *)  die "'$fork_path' is not an absolute path" ;;
+    *"$newline"*) die 'the clone directory cannot contain a newline' ;;
 esac
 
-if [ ! -d "$fork_path" ]; then
-    warn "$PROG: warning: '$fork_path' does not exist yet;"
-    warn "$PROG: warning: 'release <repo>' finds no clones until it does"
-fi
+[ -n "$fork_path" ] || die 'the clone directory cannot be empty'
+normalised=''
+for_each_root normalise_root "$fork_path"
+[ -n "$normalised" ] || die 'the clone directory cannot be empty'
+fork_path=$normalised
 
-# When this clone lives under the clone root, express it in terms of the
-# root, so moving the whole tree stays a one-line edit rather than two.
-case "$REPO_DIR" in
-    "$fork_path"/*)
-        scripts_ref="\$LFRELENG_ACTIONS_FORK_PATH/${REPO_DIR#"$fork_path"/}"
-        ;;
-    *)
-        scripts_ref=$(portable_path "$REPO_DIR")
-        ;;
-esac
-root_ref=$(portable_path "$fork_path")
+# The clone this block loads from, always as an absolute path.
+# Expressing it in terms of $LFRELENG_ACTIONS_FORK_PATH would look
+# tidier, but that variable is deliberately overridable and may hold a
+# PATH-style list of roots, at which point the derived path names
+# nothing and no tools load.
+scripts_ref=$(portable_path "$REPO_DIR")
+root_ref=$(portable_path_list "$fork_path")
 
 say "clone:      $REPO_DIR"
 say "fork path:  $fork_path"
 say "start-up files:"
 
 touched=0
+BLOCK=$(mktemp "${TMPDIR:-/tmp}/lfreleng-block.XXXXXX")
+emit_block "$root_ref" "$scripts_ref" >"$BLOCK"
+preflight "$TARGETS" all
+
 while IFS= read -r file; do
-    check_markers "$file"
     touched=1
 
     tmp=$(mktemp "${TMPDIR:-/tmp}/lfreleng-install.XXXXXX")
     if [ -f "$file" ]; then
-        strip_block <"$file" >"$tmp"
-        # strip_block drops trailing blank lines, so a file with anything
-        # left in it needs exactly one separator before the block.
-        if [ -s "$tmp" ]; then
-            printf '\n' >>"$tmp"
-        fi
+        replace_block "$file" "$BLOCK" >"$tmp"
+    else
+        cat "$BLOCK" >"$tmp"
     fi
-    emit_block "$root_ref" "$scripts_ref" >>"$tmp"
 
     install_content "$file" "$tmp"
     rm -f "$tmp"
 done <"$TARGETS"
+
+rm -f "$BLOCK"
+BLOCK=''
 
 if [ "$touched" -eq 0 ]; then
     die 'found neither bash nor zsh, and no start-up file for either'

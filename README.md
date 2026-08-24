@@ -69,14 +69,14 @@ manages:
 
 ```sh
 # >>> lfreleng-actions/shell-scripts >>>
-# Managed by shell-scripts/install.sh -- ...
 if [ -z "${LFRELENG_ACTIONS_FORK_PATH:-}" ]; then
     LFRELENG_ACTIONS_FORK_PATH="$HOME/Repositories/lfreleng-actions"
 fi
 export LFRELENG_ACTIONS_FORK_PATH
-LFRELENG_SHELL_SCRIPTS="$LFRELENG_ACTIONS_FORK_PATH/shell-scripts"
+LFRELENG_SHELL_SCRIPTS="$HOME/Repositories/lfreleng-actions/shell-scripts"
 export LFRELENG_SHELL_SCRIPTS
-if [ -r "$LFRELENG_SHELL_SCRIPTS/loader.sh" ]; then
+if [ -n "${BASH_VERSION:-}${ZSH_VERSION:-}" ] &&
+    [ -r "$LFRELENG_SHELL_SCRIPTS/loader.sh" ]; then
     . "$LFRELENG_SHELL_SCRIPTS/loader.sh"
 fi
 # <<< lfreleng-actions/shell-scripts <<<
@@ -84,19 +84,40 @@ fi
 
 <!-- markdownlint-enable MD046 -->
 
+`LFRELENG_ACTIONS_FORK_PATH` records where you keep your clones, and any
+value set earlier in the file, or inherited from the environment, wins
+over the recorded one. It may hold a `PATH`-style colon-separated list.
+`LFRELENG_SHELL_SCRIPTS` is the clone the block loads from, written as an
+absolute path rather than derived from the one above; re-run the
+installer if the clone moves.
+
 That block is the entire footprint. The installer copies nothing into
 `~/.local`, `/usr/local`, or anywhere else: the shell reads the tools
 straight out of the clone. The files it lands in are:
 
 <!-- markdownlint-disable MD013 -->
 
-| File              | When                                                                   |
-| ----------------- | ---------------------------------------------------------------------- |
-| `~/.zshrc`        | the machine has zsh, or the file exists already                        |
-| `~/.bashrc`       | the machine has bash, or the file exists already                       |
-| `~/.bash_profile` | it exists and does not itself source `~/.bashrc`, as on macOS Terminal |
+| File                                              | When                                                     |
+| ------------------------------------------------- | -------------------------------------------------------- |
+| `~/.zshrc`                                        | the machine has zsh, or the file exists already          |
+| `~/.bashrc`                                       | the machine has bash, or the file exists already         |
+| `~/.bash_profile`, `~/.bash_login`, `~/.profile`  | each one that exists                                     |
+| `~/.bash_profile`                                 | created, when none of those three exists                 |
 
 <!-- markdownlint-enable MD013 -->
+
+bash is the awkward one. It reads `~/.bashrc` for interactive non-login
+shells, and for login shells — which is what macOS Terminal starts — the
+first of `~/.bash_profile`, `~/.bash_login` and `~/.profile` that exists,
+and no other. No reading of those files can prove that one of them
+reaches `~/.bashrc`: a `. ~/.bashrc` can sit in a function nobody calls.
+Each that exists gets the block, then, and the installer creates
+`~/.bash_profile` when none does. Landing in more than one file is
+redundant rather than wrong: sourcing `loader.sh` twice re-defines the
+same functions, and `--uninstall` clears every block.
+
+Other shells read `~/.profile` as well, so the block checks for
+`$BASH_VERSION` or `$ZSH_VERSION` before loading anything.
 
 The installer honours `$ZDOTDIR` when you set it. Before changing a file
 it copies it to `<file>.lfreleng.bak`, and it refuses to touch a file
@@ -123,9 +144,11 @@ else.
 ./install.sh --status
 ```
 
-This reports the clone in use, the recorded directory, and which start-up
-files carry the block. A block in a file that the installer would no
-longer choose shows as `stray`.
+This reports the clone in use, which start-up files carry the block, and
+the clone directory the block records — alongside the value the current
+shell happens to carry, which right after an install is the previous
+answer, or none. A block in a file that the installer would no longer
+choose shows as `stray`.
 
 ### Uninstalling
 
@@ -133,9 +156,28 @@ longer choose shows as `stray`.
 ./install.sh --uninstall
 ```
 
-This removes the block from every start-up file that carries one, keeping
-a `.lfreleng.bak` copy of each. Delete the clone afterwards and nothing
-remains.
+This removes the block from every start-up file it can reach, keeping a
+`.lfreleng.bak` copy of each.
+
+Two kinds of file survive on purpose, and want removing by hand if you
+want the footprint gone entirely:
+
+- the `<file>.lfreleng.bak` backups, one beside each file it changed
+- any start-up file the installer created that did not exist before, such
+  as a `~/.bash_profile` on a home that had none
+
+Delete the clone afterwards and nothing else remains.
+
+One case needs your help. `$ZDOTDIR` moves zsh's start-up file out of
+`$HOME`, and nothing here records where it pointed at install time, so
+run the uninstall with the same value you installed with:
+
+```bash
+ZDOTDIR=/your/zsh/dir ./install.sh --uninstall
+```
+
+The uninstaller says as much when it finds nothing to remove. A block in
+`$HOME` turns up either way.
 
 ### Leaving a tool out
 
@@ -184,6 +226,7 @@ release: pushed signed tag 'v0.5.0' to 'upstream'
 | `release latest <remote>`        | The same, publishing to a named remote                     |
 | `release v1.2.3`                 | Tag the current clone with a version you name yourself     |
 | `release v1.2.3 <remote>`        | The same, publishing to a named remote                     |
+| `release --tag <tag> [remote]`   | Tag that name as given, whatever it holds                  |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -193,8 +236,19 @@ version to tag, so it reads as a repository name, and `release` assumes
 `latest`. Inside a clone the older reading stands — a bare word is the
 version to tag — which is why the three-word form exists.
 
-A first word holding a slash counts as a path to the clone, so a pasted or
+A word holding a slash counts as a path to the clone, so a pasted or
 tab-completed directory works as well as a bare repository name.
+
+`--tag` is the way out of the two ambiguities the other forms have to
+guess at. A tag holding a slash, such as `release/1.2`, would otherwise
+read as a path — `release other/repo` must not put a tag named after
+somebody else's repository on the clone under foot — and a tag named
+`latest` would read as the keyword. Say either outright:
+
+```bash
+release --tag release/1.2
+release --tag latest
+```
 
 No `release <repo> <tag>` form exists, by design: nothing tells it apart
 from `release <tag> <remote>`. To tag a named version in another clone,
@@ -228,6 +282,11 @@ when `origin` is a different remote. The fast-forward is strict: it
 reports local commits that never reached the source remote, and drops
 none of them.
 
+The source of truth is `upstream` when the clone has one, otherwise
+`origin`, otherwise the remote you named. Naming a remote picks where the
+tag lands, not which history is authoritative — which is why
+`release v1.2.3 origin` still syncs from `upstream` when there is one.
+
 The sync steps aside, with a warning, when `HEAD` sits somewhere other than
 the source remote's default branch **and** you named a version explicitly.
 Tagging a maintenance branch is a legitimate, if rarer, act, and the
@@ -236,8 +295,17 @@ draft describes the default branch, so `release` checks that branch out
 first, which is what lets `release <repo>` work against a clone left
 sitting on whatever feature branch was in hand.
 
-Uncommitted work stops the run instead. Stashing on the caller's behalf
-would leave changes parked somewhere they did not put them.
+Uncommitted work stops the run while the sync is running, since the sync
+is what would carry it somewhere else. Stashing on the caller's behalf
+would leave changes parked somewhere they did not put them. Untracked
+files stop it too, in the narrower case where the branch has to change: a
+checkout carries them onto the default branch rather than leaving them
+behind. Files that `.gitignore` covers do not count.
+
+With the sync stood aside — an explicit version on a side branch, or
+`RELEASE_NO_SYNC` — nothing moves, so modified files draw a warning and
+the tag records `HEAD` as it stands. That is the point of asking for that
+form.
 
 ### What it refuses to do
 
@@ -245,24 +313,30 @@ would leave changes parked somewhere they did not put them.
 - Tag a digitless word that also names a clone, which is the repository
   form typed from inside some other repository
 - Sync, or switch branches, over uncommitted work
+- Switch branches over untracked files that `.gitignore` does not cover
 - Discard local commits to sync
 - Reuse a tag that already exists, locally or on the remote
 - Push after signing the tag failed
+- Act on a remote that fetches from one URL and pushes to another, since
+  the release read would not describe what the tag landed on
 - Guess, when `latest` matches no draft release, or more than one
 - Push while `release-drafter` is still updating the draft
+- Trust an unreadable remote, or an unusable poll setting, as if it were
+  a clean answer
 
 ### Environment
 
 <!-- markdownlint-disable MD013 -->
 
-| Variable                     | Default                | Meaning                                                        |
-| ---------------------------- | ---------------------- | -------------------------------------------------------------- |
-| `LFRELENG_ACTIONS_FORK_PATH` | set by `install.sh`    | Directory holding your clones; searched for a named repository |
-| `RELEASE_REPO_ROOT`          | unset                  | Overrides the above for this tool alone                        |
-| `RELEASE_NO_SYNC`            | unset                  | Any value tags `HEAD` as it stands, skipping the sync          |
-| `RELEASE_DRAFTER_WORKFLOW`   | `release-drafter.yaml` | Workflow file to wait on, falling back to `.yml` when unset    |
-| `RELEASE_DRAFTER_TIMEOUT`    | `600`                  | Seconds to wait for that workflow before giving up             |
-| `RELEASE_DRAFTER_POLL`       | `10`                   | Seconds between checks                                         |
+| Variable                     | Default                | Meaning                                                           |
+| ---------------------------- | ---------------------- | ----------------------------------------------------------------- |
+| `LFRELENG_ACTIONS_FORK_PATH` | set by `install.sh`    | Directory holding your clones; searched for a named repository    |
+| `RELEASE_REPO_ROOT`          | unset                  | Overrides the above for this tool alone                           |
+| `RELEASE_NO_SYNC`            | unset                  | Any non-empty value tags `HEAD` as it stands, skipping the sync   |
+| `RELEASE_DRAFTER_WORKFLOW`   | `release-drafter.yaml` | Workflow file to wait on, falling back to `.yml` when unset       |
+| `RELEASE_DRAFTER_TIMEOUT`    | `600`                  | Seconds to wait for that workflow before giving up                |
+| `RELEASE_DRAFTER_POLL`       | `10`                   | Seconds between checks; a positive whole number                   |
+| `RELEASE_GH_HOST`            | unset                  | Host name to pass to `gh`, when the remote's authority is not one |
 
 <!-- markdownlint-enable MD013 -->
 
