@@ -60,17 +60,23 @@ check() {
 }
 
 # Assert that the output of a shell one-liner equals an expected string.
+# Only stdout counts: an interactive bash started without a controlling
+# terminal announces 'no job control in this shell' on stderr, which is
+# noise rather than failure. Stderr is kept back for the failure report.
 check_output() {
     _name=$1
     _want=$2
     _home=$3
     shift 3
 
-    if _got=$(env -i HOME="$_home" PATH="$PATH" "$@" 2>&1) &&
-        [ "$_got" = "$_want" ]; then
+    _errlog="$SANDBOX/stderr.log"
+    _got=$(env -i HOME="$_home" PATH="$PATH" "$@" 2>"$_errlog") || true
+
+    if [ "$_got" = "$_want" ]; then
         pass "$_name"
     else
-        fail "$_name" "expected '$_want', got '$_got'"
+        fail "$_name" "expected '$_want', got '$_got'
+ stderr: $(cat "$_errlog")"
     fi
 }
 
@@ -191,7 +197,7 @@ for shell in bash zsh; do
     if got=$(env -i HOME="$home" PATH="$PATH" \
         LFRELENG_SHELL_SCRIPTS_SKIP=release "$shell" -c \
         ". '$REPO_DIR/loader.sh'; command -v release >/dev/null || echo none" \
-        2>&1) && [ "$got" = none ]; then
+        2>/dev/null) && [ "$got" = none ]; then
         pass "$shell: LFRELENG_SHELL_SCRIPTS_SKIP leaves a tool out"
     else
         fail "$shell: LFRELENG_SHELL_SCRIPTS_SKIP leaves a tool out" "$got"
@@ -281,10 +287,20 @@ fi
 
 # --- a start-up file that does not exist yet -------------------------------
 
+# Which file appears depends on the shells the machine carries: a Linux
+# image with no zsh gets ~/.bashrc alone, and rightly so. Assert that at
+# least one start-up file was created and carries the block.
 fresh="$SANDBOX/home-fresh"
 mkdir -p "$fresh"
-if install_into "$fresh" "$forks" >/dev/null 2>&1 &&
-    grep -qxF "$BEGIN_MARK" "$fresh/.zshrc"; then
+created=0
+if install_into "$fresh" "$forks" >/dev/null 2>&1; then
+    for file in "$fresh/.zshrc" "$fresh/.bashrc"; do
+        if [ -f "$file" ] && grep -qxF "$BEGIN_MARK" "$file"; then
+            created=$((created + 1))
+        fi
+    done
+fi
+if [ "$created" -gt 0 ]; then
     pass 'install: creates a missing start-up file'
 else
     fail 'install: creates a missing start-up file'

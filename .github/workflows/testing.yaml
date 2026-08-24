@@ -30,12 +30,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux covers bash and the GNU userland; macOS covers zsh, the
-        # BSD userland, and the bash 3.2 that Apple still ships. The test
-        # suite skips a shell it cannot find, so neither runner needs
-        # extra packages -- which also keeps the egress allow-list below
-        # from having to reach a distribution mirror.
-        os: ["ubuntu-latest", "macos-latest"]
+        include:
+          # Linux brings the GNU userland; macOS brings the BSD userland,
+          # zsh, and the bash 3.2 that Apple still ships. Between them
+          # every shell and userland the tools claim to support gets
+          # exercised.
+          #
+          # required-shells names what that runner is known to carry. The
+          # suite skips a shell it cannot find, which is right on a
+          # laptop but would let a broken image pass here unnoticed, so
+          # the job checks the list afterwards. The ubuntu-latest image
+          # ships no zsh, and adding one would buy little: zsh behaves
+          # the same on either platform, and macOS already covers it.
+          - os: "ubuntu-latest"
+            required-shells: "bash"
+          - os: "macos-latest"
+            required-shells: "bash zsh"
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
@@ -78,25 +88,28 @@ jobs:
           ./tests/run-tests.sh
 
       # The suite reports a missing shell as a skip rather than a
-      # failure, which is right for a laptop but would let a broken
-      # matrix leg pass silently here. Both runners are known to carry
-      # bash and zsh, so demand them.
-      - name: "Require both shells to have run"
+      # failure. Demand the ones this runner is known to carry, so an
+      # image that quietly loses a shell fails the job instead of
+      # testing less than it claims to.
+      - name: "Require the expected shells to have run"
         shell: bash
+        env:
+          REQUIRED_SHELLS: ${{ matrix.required-shells }}
+          MATRIX_OS: ${{ matrix.os }}
         run: |
-          # Require both shells to have run
+          # Require the expected shells to have run
           missing=0
-          for required in bash zsh; do
+          for required in $REQUIRED_SHELLS; do
             if ! command -v "$required" > /dev/null 2>&1; then
-              echo "Error: $required is absent from ${{ matrix.os }} ❌"
+              echo "Error: $required is absent from $MATRIX_OS ❌"
               missing=1
             fi
           done
           if [ "$missing" -ne 0 ]; then
             exit 1
           fi
-          echo "Tested against bash and zsh on ${{ matrix.os }} ✅"
-          echo "Tested against bash and zsh on ${{ matrix.os }} ✅" \
+          echo "Tested against $REQUIRED_SHELLS on $MATRIX_OS ✅"
+          echo "Tested against $REQUIRED_SHELLS on $MATRIX_OS ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
       # An installer that cannot be undone is worse than no installer.
