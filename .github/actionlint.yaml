@@ -1,11 +1,9 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Path-specific configurations.
-paths:
-  .github/workflows/testing.yaml:
-    ignore:
-      # Ignore deliberate test failure
-      - 'input "invalid_input" is not defined in action .+'
-      - 'missing input "input" which is required by action .+'
+#
+# Nothing to override at present: this repository holds shell tools rather
+# than a composite action, so no workflow deliberately mis-calls one.
+paths: {}
