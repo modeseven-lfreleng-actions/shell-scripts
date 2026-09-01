@@ -1,9 +1,9 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Action test/validation workflow
-name: "Test GitHub Action 🧪"
+# Shell tool test/validation workflow
+name: "Test Shell Scripts 🧪"
 
 # yamllint disable-line rule:truthy
 on:
@@ -20,13 +20,32 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
+  ### Run the test suite on both supported platforms ###
   tests:
-    name: "Test local GitHub Action"
-    runs-on: ubuntu-latest
+    name: "Test on ${{ matrix.os }}"
+    runs-on: "${{ matrix.os }}"
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux brings the GNU userland; macOS brings the BSD userland,
+          # zsh, and the bash 3.2 that Apple still ships. Between them
+          # every shell and userland the tools claim to support gets
+          # exercised.
+          #
+          # required-shells names what that runner is known to carry. The
+          # suite skips a shell it cannot find, which is right on a
+          # laptop but would let a broken image pass here unnoticed, so
+          # the job checks the list afterwards. The ubuntu-latest image
+          # ships no zsh, and adding one would buy little: zsh behaves
+          # the same on either platform, and macOS already covers it.
+          - os: "ubuntu-latest"
+            required-shells: "bash"
+          - os: "macos-latest"
+            required-shells: "bash zsh"
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
@@ -50,41 +69,62 @@ jobs:
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
+      - name: "Report the shells under test"
         shell: bash
         run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Report the shells under test
+          for candidate in bash zsh; do
+            if command -v "$candidate" > /dev/null 2>&1; then
+              echo "$candidate: $("$candidate" --version | head -1)"
+            else
+              echo "$candidate: not installed; its tests will be skipped"
+            fi
+          done
 
-      - name: "Running local action: ${{ github.repository }}"
-        uses: ./
-        with:
-          input: "test input 💬"
+      - name: "Run the test suite"
+        shell: bash
+        run: |
+          # Run the test suite
+          ./tests/run-tests.sh
 
-      - name: "Validated local action: ${{ github.repository }}"
+      # The suite reports a missing shell as a skip rather than a
+      # failure. Demand the ones this runner is known to carry, so an
+      # image that quietly loses a shell fails the job instead of
+      # testing less than it claims to.
+      - name: "Require the expected shells to have run"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          REQUIRED_SHELLS: ${{ matrix.required-shells }}
+          MATRIX_OS: ${{ matrix.os }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Require the expected shells to have run
+          missing=0
+          for required in $REQUIRED_SHELLS; do
+            if ! command -v "$required" > /dev/null 2>&1; then
+              echo "Error: $required is absent from $MATRIX_OS ❌"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Tested against $REQUIRED_SHELLS on $MATRIX_OS ✅"
+          echo "Tested against $REQUIRED_SHELLS on $MATRIX_OS ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-      # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: ./
-        id: failure
-        continue-on-error: true
-        with:
-          invalid_input: "Some garbage"
-
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      # An installer that cannot be undone is worse than no installer.
+      # The suite proves this in a sandbox HOME; do it once more against
+      # the runner's real HOME, which is the shape a colleague meets.
+      - name: "Install and uninstall against the real HOME"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Install and uninstall against the real HOME
+          ./install.sh --yes
+          ./install.sh --status
+          grep -q 'LFRELENG_SHELL_SCRIPTS' "$HOME/.bashrc"
+          ./install.sh --uninstall
+          if grep -q 'lfreleng-actions/shell-scripts' "$HOME/.bashrc"; then
+            echo "Error: uninstall left the block behind ❌"
+            exit 1
+          fi
+          echo "Install and uninstall round-tripped cleanly ✅"
